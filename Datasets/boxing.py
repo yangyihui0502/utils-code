@@ -4,6 +4,7 @@ import joblib
 
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 import pytorch3d.transforms as transforms 
 import smplx
 import torch
@@ -17,20 +18,23 @@ import subprocess
 import cv2
 import copy
 from PIL import Image
+import copy
 import pdb
 import os
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 import sys
 from scipy.spatial.transform import Rotation
 import pyquaternion as pyquat
+from egomocap.utils.wis3d_utils import make_vis3d, vis3d_add_coords, vis3d_add_skeleton
+from egomogen.scripts.boxing_render import adjust_scene2ground
 from egomogen.utils.net_utils import load_other_network
 from egomogen.utils.lowlevel_repr_utils import *
 from egomogen.utils.geo_transform import apply_T_on_points
 from pytorch3d.transforms import axis_angle_to_matrix
 from egomogen.utils.smplx_utils import make_smplx
 from egomogen.utils.data_utils import *
-from egomogen.utils.motion_repr_transform import MoReprTrans
-
+from egomogen.utils.motion_repr_transform import *
+from egomogen.scripts.visualize_dataset import visualize
 
 # T_z2y: zup to yup
 T_z2y = torch.FloatTensor([[
@@ -38,71 +42,6 @@ T_z2y = torch.FloatTensor([[
     [0, 0, 1, 0],
     [0, -1, 0, 0],
     [0, 0, 0, 1]]]) # (1, 4, 4)
-
-
-'''
-def get_smpl_parents():
-    bm_path = os.path.join(SMPLH_PATH, 'male/model.npz')
-    npz_data = np.load(bm_path)
-    ori_kintree_table = npz_data['kintree_table'] # 2 X 52 
-    parents = ori_kintree_table[0, :22] # 22 
-    parents[0] = -1 # Assign -1 for the root joint's parent idx.
-
-    return parents
-
-def local2global_pose(local_pose):
-    # local_pose: T X J X 3 X 3 
-    kintree = get_smpl_parents() 
-
-    bs = local_pose.shape[0]
-
-    local_pose = local_pose.view(bs, -1, 3, 3)
-
-    global_pose = local_pose.clone()
-
-    for jId in range(len(kintree)):
-        parent_id = kintree[jId]
-        if parent_id >= 0:
-            global_pose[:, jId] = torch.matmul(global_pose[:, parent_id], global_pose[:, jId])
-
-    return global_pose # T X J X 3 X 3 
-
-def quat_ik_torch(grot_mat):
-    # grot: T X J X 3 X 3 
-    parents = get_smpl_parents() 
-
-    grot = transforms.matrix_to_quaternion(grot_mat) # T X J X 4 
-
-    res = torch.cat(
-            [
-                grot[..., :1, :],
-                transforms.quaternion_multiply(transforms.quaternion_invert(grot[..., parents[1:], :]), \
-                grot[..., 1:, :]),
-            ],
-            dim=-2) # T X J X 4 
-
-    res_mat = transforms.quaternion_to_matrix(res) # T X J X 3 X 3 
-
-    return res_mat 
-
-def quat_fk_torch(lrot_mat, lpos):
-    # lrot: N X J X 3 X 3 (local rotation with reprect to its parent joint)
-    # lpos: N X J X 3 (root joint is in global space, the other joints are offsets relative to its parent in rest pose)
-    parents = get_smpl_parents() 
-
-    lrot = transforms.matrix_to_quaternion(lrot_mat)
-
-    gp, gr = [lpos[..., :1, :]], [lrot[..., :1, :]]
-    for i in range(1, len(parents)):
-        gp.append(
-            transforms.quaternion_apply(gr[parents[i]], lpos[..., i : i + 1, :]) + gp[parents[i]]
-        )
-        gr.append(transforms.quaternion_multiply(gr[parents[i]], lrot[..., i : i + 1, :]))
-
-    res = torch.cat(gr, dim=-2), torch.cat(gp, dim=-2)
-
-    return res
-'''
 
 class BoxingDataset(Dataset):
     def __init__(
@@ -155,7 +94,7 @@ class BoxingDataset(Dataset):
             self.file_path = params['origin_file_path']
             
             for file_idx in range(len(pose_pos)):
-                prev_params = self.get_motion_rel2prev(pose_pos[file_idx].reshape(1,-1,21,3),pose_rot[file_idx].reshape(1,-1,21,3,3))
+                prev_params = self.get_motion_rel2prev(pose_pos[file_idx].reshape(1,-1,22,3),pose_rot[file_idx].reshape(1,-1,22,3,3))
                 train_motion, test_motion = self.split_motion(prev_params, camera_params, file_idx)
 
                 self.train_motions.extend(train_motion)
@@ -175,7 +114,7 @@ class BoxingDataset(Dataset):
                 train_data = pickle.load(file)
             data_len = len(train_data)
             pose_series = []
-            camera_params = []
+            camera_trans = []
             final_params = []
             for idx in tqdm.tqdm(range(data_len)):
                 meta = train_data[idx].meta
@@ -187,17 +126,17 @@ class BoxingDataset(Dataset):
                 '''
                 pose_series: unnormalized, frames*256
                 image: normalized, frames*224*224*3
-                camera_params: unnormalized, frames*16
+                camera_params: unnormalized, frames*9
                 '''
                 pose_series.extend(concat_data.pose_series)
-                camera_params.extend(concat_data.camera_params)
+                camera_trans.extend(concat_data.camera_params[:, 6:])
                 final_params.append(concat_data)
             norm_pose = self.normalize(pose_series, 'EgoMoGen_data/normalize/pose_series_norm.npy')
-            norm_camera = self.normalize(camera_params, 'EgoMoGen_data/normalize/camera_params_norm.npy')
+            norm_camera_trans = self.normalize(camera_trans, 'EgoMoGen_data/normalize/camera_trans_norm.npy')
             
             for idx in range(len(final_params)):
                 final_params[idx].pose_series = Normalize(final_params[idx].pose_series,norm_pose)
-                final_params[idx].camera_params = Normalize(final_params[idx].camera_params,norm_camera)
+                final_params[idx].camera_params[:, 6:] = Normalize(final_params[idx].camera_params[:, 6:],norm_camera_trans)
             with open(os.path.join(folder,'preprocessed_data/final_train_data.pkl'),'wb') as pickle_file:
                 pickle.dump(final_params,pickle_file)
         
@@ -216,7 +155,8 @@ class BoxingDataset(Dataset):
         for file_name in ['027_ma_comb1_liu_comb2_joints_smpl','028_ma_comb3_liu_comb4_joints_smpl']:
             file_path = os.path.join(folder,file_name,'smplx_params/smplx_params.npy')
             
-            params = np.load(file_path,allow_pickle=True)
+            # params = np.load(file_path,allow_pickle=True)[:100]
+            params = np.load(file_path, allow_pickle=True)
             self.file_path[self.file_num] = file_path
 
             smplx_params = self.load_body_params(params[:,0])
@@ -224,7 +164,15 @@ class BoxingDataset(Dataset):
 
             camera_params=self.load_camera(params[:,0])
             
-            self.pose_pos.append(smplx_output.joints[:,:21,:])
+            self.pose_pos.append(smplx_output.joints[:, :22, :])
+
+            # scene=trimesh.load('blender/assets/boxring_color_mesh.obj')
+            # height=adjust_scene2ground(scene)
+            # scene.vertices[:,1]-=height
+            # vis3d = make_vis3d(None, f'smplx_{file_name}', 'output/visualize_dataset',)
+            # vis3d.add_mesh(scene, name='scene')
+            # vis3d_add_skeleton(vis3d, 0, smplx_output.joints[0, :22], parents, f'frame_0')
+
             self.smplx_body_params.append(smplx_params)    # [file_num,...]
             self.camera_params.append(camera_params)
             self.file_num += 1
@@ -243,18 +191,23 @@ class BoxingDataset(Dataset):
         full_trans_matrix = []
         for params_idx in range(len(params)):
             origin_matrix=params[params_idx,69:85].reshape(4,4)
-            camera_params=np.linalg.inv(origin_matrix)
+            camera_params=torch.from_numpy(np.linalg.inv(origin_matrix))
+            # camera_params = torch.from_numpy(origin_matrix)
 
+            rot_6d = transforms.matrix_to_rotation_6d(camera_params[:3,:3])
+            camera_params = torch.cat((rot_6d,camera_params[:3,3]))
             # trans_matrix=np.eye(4)
             # trans_matrix[:3,3]=camera_params[:3,3]
             # full_trans_matrix.append(trans_matrix)
+            # full_trans_matrix.append(camera_params[:3])
             full_trans_matrix.append(camera_params)
 
-        full_trans_matrix = torch.tensor(full_trans_matrix)
-        return full_trans_matrix.reshape(len(full_trans_matrix),16)
+        full_trans_matrix = torch.stack(full_trans_matrix)
+        return full_trans_matrix.reshape(len(full_trans_matrix),9)
         
     def load_image(self,folder):
-        for file_name in os.listdir(folder):
+        # for file_name in os.listdir(folder):
+        for file_name in ['027_ma_comb1_liu_comb2_joints_smpl','028_ma_comb3_liu_comb4_joints_smpl']:  
             if file_name == 'preprocessed_data':
                 continue
             # image_folder = os.path.join(self.folder,file_name,'rgb')
@@ -266,15 +219,19 @@ class BoxingDataset(Dataset):
             #     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             #     self.image.append(image_rgb)
 
-            image_rgb = np.load(image_path,mmap_mode='r')
+            # image_rgb = np.load(image_path,mmap_mode='r')[:100]
+            image_rgb = np.load(image_path, mmap_mode='r')
             self.image.append(image_rgb[downsample:])
 
     def shift_smplx2matrix(self,smplx_dict):
         root_pos = torch.eye(4)
+        pose_rot = torch.zeros((smplx_dict['transl'].shape[0], njoints, 3, 3))
         # root_pos = root_pos.repeat(len(smplx_dict['transl']),1,1)
 
         body_pose = smplx_dict['body_pose']
-        pose_rot = axis_angle_to_matrix(body_pose)
+        orient = smplx_dict['global_orient']
+        pose_rot[:, 1:] = axis_angle_to_matrix(body_pose)
+        pose_rot[:, 0] = axis_angle_to_matrix(orient)
         
         # root_trans = smplx_dict['transl']
         # root_rotation = axis_angle_to_matrix(smplx_dict['global_orient'])
@@ -286,7 +243,7 @@ class BoxingDataset(Dataset):
 
         #full_pose_rot = torch.stack(full_pose_rot)
         #full_root_pos = torch.stack(full_root_pos)
-        return pose_rot,root_pos
+        return pose_rot.double().to('cuda'),root_pos
 
 
     def get_rel_position(self,pose_rot,root_pos):
@@ -297,7 +254,7 @@ class BoxingDataset(Dataset):
         return pose_pos
 
 
-    def get_motion_rel2prev(self, pose_pos, pose_rot):   # 把世界坐标系转到local 更好学习
+    def get_motion_rel2prev(self, pose_pos, pose_rot):   
         # pose_pos:(1,frames,joints,3)——每个joint在全局坐标系的位置
         # pose_rot:每个joint相对父节点的rotation
         
@@ -308,7 +265,7 @@ class BoxingDataset(Dataset):
         pose_rot = matrix.forward_kinematics(pose_rot, parents)
         # get root pos
         root_pos = pose_pos[:, :, 0].clone()
-        root_pos[..., 1] = 0 # y = 0
+        root_pos[..., 1] = 0 # y = 0,把root的投影点作为原点
         # get pose vel
         pose_vel = (pose_pos[:, downsample:] - pose_pos[:, :-downsample]) * train_fps
         # get root mat
@@ -323,10 +280,10 @@ class BoxingDataset(Dataset):
         root_ctrl = torch.cat((root_off_2d, root_dir_2d), dim=-1)
         
         return dotdict(
-            pose_pos = pose_pos[:,downsample:].double(),
-            pose_rot = pose_rot[:,downsample:].double(),
-            pose_vel = pose_vel.double(),
-            root_mat = root_mat[:,downsample:].double(),
+            pose_pos = pose_pos[:,downsample:].double(),  # global,在后面concat的时候转换
+            pose_rot = pose_rot[:,downsample:].double(),  # global
+            pose_vel = pose_vel.double(),                 # global
+            root_mat = root_mat[:,downsample:].double(),  # root坐标系的tran matrix
             root_rot = root_rot[:,downsample:].double(),
             root_pos = root_pos[:,downsample:].double(),
             root_off = root_off_2d.double(),
@@ -359,7 +316,7 @@ class BoxingDataset(Dataset):
         # self.normalize(all_params,'pose_series')
         # self.normalize(all_params,'image')
 
-        os.makedirs(os.path.join(self.folder,'preprocessed_data'))
+        os.makedirs(os.path.join(self.folder,'preprocessed_data'), exist_ok=True)
     
         with open(os.path.join(self.folder,'preprocessed_data','preprocessed_data.pkl'),'wb') as pickle_file:
             pickle.dump({'pose_pos':self.pose_pos, 'pose_rot':self.pose_rot, 'camera_params':self.camera_params, 'origin_file_path':self.file_path},pickle_file)
@@ -374,23 +331,22 @@ class BoxingDataset(Dataset):
         for d in range(downsample):
             frames, FN, TRAIN_FN = self.get_train_test_frames(data_length, d)
             train_data.append(dotdict(
-                meta = self.get_meta(self.file_path[file_idx], d, 'train', file_idx),
+                meta = self.get_meta(self.file_path[file_idx], d, 'train', file_idx, motion_data['root_mat'][0][frames[:TRAIN_FN]]),
                 motion = self.get_actor_motion(motion_data, frames[:TRAIN_FN], squeeze=False),
-                camera_params = camera_params[:, frames[:TRAIN_FN]]
+                camera_params = camera_params[file_idx][frames[:TRAIN_FN]],
+                # root_mat = motion_data['root_mat'][frames[:TRAIN_FN]]
             ))
             test_data.append(dotdict(
-                meta = self.get_meta(self.file_path[file_idx], d, 'test', file_idx),
+                meta = self.get_meta(self.file_path[file_idx], d, 'test', file_idx, motion_data['root_mat'][0][frames[TRAIN_FN:]]),
                 motion = self.get_actor_motion(motion_data, frames[TRAIN_FN:], squeeze=False),
-                camera_params = camera_params[:, frames[TRAIN_FN:]]
+                camera_params = camera_params[file_idx][frames[TRAIN_FN:]],
+                # root_mat = motion_data['root_mat'][frames[:TRAIN_FN]]
             ))
         return train_data, test_data
     
     def concat_params(self, meta, params, camera_params, image, squeeze):  
+        # calculate local coodinate and concat params
         frames = list(range(params.pose_vel.size(1)))
-
-        # normalize
-        # root_ctrl = params.root_ctrl[:, frames]
-        # pose = LowlevelMoRepr.cal_pose(params,frames)
 
         if squeeze:
             pose_series = LowlevelMoRepr.cal_pose_series(params, frames)[0]
@@ -405,7 +361,7 @@ class BoxingDataset(Dataset):
             # root_info = root_info,
         )
 
-    def get_meta(self, origin_file_path, downsample, split, file_idx):
+    def get_meta(self, origin_file_path, downsample, split, file_idx, root_mat):
         return dotdict(
             origin_file_path = origin_file_path,
             downsample = downsample,
@@ -413,6 +369,7 @@ class BoxingDataset(Dataset):
             file_idx = file_idx,
             # origin_frames = frames,
             skeleton = skeleton,
+            root_mat = root_mat,
         )
     
 
@@ -471,8 +428,16 @@ class BoxingDataset(Dataset):
         # padding_motion[data_len-pose_sid:] = pose_series[data_len].repeat(self.block_size-data_len+pose_sid)
         
         padding_motion.extend(pose_series[pose_sid:data_len])
-        padding_motion.extend(pose_series[data_len].repeat(self.block_size-data_len+pose_sid))
+        padding_motion.extend(pose_series[data_len-1].reshape(1,-1).repeat(self.block_size-data_len+pose_sid,1))
         return padding_motion
+
+
+    def pad_image(self, image, image_sid, data_len):
+        padding_image = []
+ 
+        padding_image.extend(image[image_sid:data_len])
+        padding_image.extend(image[data_len-1].reshape(1,224,224,3).tile(self.block_size-data_len+image_sid,1,1,1))
+        return padding_image
 
 
     def __len__(self):
@@ -487,15 +452,28 @@ class BoxingDataset(Dataset):
         meta = wholeseq.meta
         pose_series = wholeseq.pose_series
         camera_params = wholeseq.camera_params
-        image = wholeseq.image
+        image = torch.from_numpy(wholeseq.image)
         
-        pose_sid = random.randint(0,len(self.data)-1)   # start frame
+        pose_sid = random.randint(0,len(wholeseq.pose_series)-1)   # start frame
         pose_eid = pose_sid + self.block_size   # end frame
+       
+        seq_meta = dotdict(
+            original_file_path = meta.origin_file_path,
+            downsample = meta.downsample,
+            split = meta.split,
+            skeleton = meta.skeleton,
+            init_root_mat = meta.root_mat[pose_sid],
+        )
+        if pose_eid > len(wholeseq.pose_series):
+            pose_series = self.pad_motion(pose_series, pose_sid, len(wholeseq.pose_series))
+            image = self.pad_image(image, pose_sid, len(wholeseq.pose_series))
+            camera_params = self.pad_motion(camera_params, pose_sid, len(wholeseq.pose_series))
+            pose_eid = len(wholeseq.pose_series)
 
-        if pose_eid >= len(self.data):
-            pose_series = self.pad_motion(pose_series, pose_sid, len(self.data))
-            image = self.pad_motion(image, pose_sid, len(self.data))
-            camera_params = self.pad_motion(camera_params, pose_sid, len(self.data))
+            pose_series = torch.stack(pose_series)
+            camera_params = torch.stack(camera_params)
+            image = torch.stack(image)
+
         else:
             pose_series = pose_series[pose_sid:pose_eid]
             image = image[pose_sid:pose_eid]
@@ -504,16 +482,28 @@ class BoxingDataset(Dataset):
         mask = torch.ones(self.block_size)
         mask[pose_eid - pose_sid:] = 0
         
-        return dotdict(
-            meta = meta,
-            mask = mask,
-            pose_series = pose_series,
-            camera_params = camera_params,
-            image = image,
-        )
+        return {
+            'meta' : seq_meta,
+            'mask' : mask,
+            'pose_series' : pose_series,
+            'camera_params' : camera_params,
+            'image' : image,
+        }
 
 if __name__ == "__main__":
     #dataset=BoxingDataset(folder='/nas/share/ego_data/boxing/ego_render/')
     dataset = BoxingDataset(folder='EgoMoGen_data')
-    print(dataset.__getitem__(1))
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
+    for idx,data in enumerate(dataloader):
+        data = dotdict(
+            meta = data['meta'],
+            mask = data['mask'],
+            pose_series = data['pose_series'],
+            camera_params = data['camera_params'],
+            image = data['image']
+        )
+        image = data['image']
+        camera_params = data['camera_params']
+        pose_series = data['pose_series']
+        visualize(data)
