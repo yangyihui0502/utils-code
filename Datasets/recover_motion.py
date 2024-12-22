@@ -11,6 +11,7 @@ def get_camera_unnormalized(camera_pos):
     camera_pos = Renormalize(camera_pos.cpu(),norm_data)
     return camera_pos
 
+
 # recover image
 image = image*255
 image = image.to(dtype=torch.uint8)
@@ -18,6 +19,12 @@ image = image.to(dtype=torch.uint8)
 # recover ai4animation local motion
 from utils.motion_repr_transform import MoReprTrans
 from utils.geo_transform import *
+T_y2z = torch.FloatTensor([[
+    [1, 0, 0, 0],
+    [0, 0, -1, 0],
+    [0, 1, 0, 0],
+    [0, 0, 0, 1]]]).to(dtype=torch.double) # (1, 4, 4),(x,y,z)->(x,z,-y)
+
 loc_params = get_motion_unnormalized(pose_series.double())
 loc_params = MoReprTrans.split_pose(loc_params)
 init_root_mat = meta.init_root_mat.double().to('cpu')   # 序列的第一帧的根节点，用于后面的递推
@@ -25,6 +32,7 @@ init_root_mat = meta.init_root_mat.double().to('cpu')   # 序列的第一帧的�
 glb = get_glb_root_by_loc(loc_params, init_root_mat)
 glb = get_glb_pose_by_loc(loc_params, glb=glb)
 glb.pose_pos = apply_T_on_points(glb.pose_pos, T_y2z)
+glb.pose_rot[:, :, :] = T_y2z[..., :3, :3] @ glb.pose_rot[:, :, :] 
 
 def get_glb_root_by_loc(loc, init_root_mat, glb=None):
     # 将前一帧的root坐标系转化为global坐标系
