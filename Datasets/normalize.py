@@ -1,5 +1,6 @@
 from utils.data_utils import save_norm_data
 # 传入所有train_data,按idx统一计算norm
+# 如果std过小，还需要对std进行放大，保证不出现爆炸
 def normalize(self, data, norm_file):
         shape = data[0].shape
         all_data = [data[i].view(-1, shape[-1]) for i in range(len(data))]

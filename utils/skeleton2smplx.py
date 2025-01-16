@@ -120,23 +120,32 @@ def inverse_kinematics_motion(
         global_rot[..., 1:, :])
     return local_pos[..., 1:, :], local_rot[..., 1:, :]
 
-def skeleton2mesh(glb_pos, glb_rot, parents):
-    trans = glb_pos[0]
-    orient = glb_rot[0]
+def skeleton2mesh(glb_pos, glb_rot, parents, zero_pose_pelvis=0):
+    # trans = glb_pos[0] - zero_pose_pelvis
+    orient = glb_rot[0].clone()
     # glb_rot = glb_rot[1:]
     # glb_pos = glb_pos[1:]
 
     glb_rot = matrix_to_quaternion(glb_rot)
     loc_pos, loc_rot = inverse_kinematics_motion(glb_pos, glb_rot, parents)
     body_pose = quaternion_to_axis_angle(loc_rot)
-    orient = matrix_to_axis_angle(orient)
+    global_orient = matrix_to_axis_angle(orient)
 
     smplx_model = make_smplx(type='boxing').double()
-    smplx_output=smplx_model(global_orient=np.double(orient.reshape(1,-1)),
+    trans = np.zeros_like(global_orient)
+    # body_pose = np.zeros_like(body_pose)
+    # orient = np.zeros_like(orient)
+    smplx_output = smplx_model(global_orient=np.double(global_orient.reshape(1,-1)),
                              transl=np.double(trans.reshape(1,-1)),
                              body_pose=np.double(body_pose.reshape(1,-1,3)),
                             )
-    faces=smplx_model.bm.faces
-    verts=smplx_output.vertices.detach().numpy().squeeze()
+    # 对齐pelvis和trans
+    delta = smplx_output.joints[0,0] - glb_pos[0]
+    delta = delta.detach().numpy()
+
+    faces = smplx_model.bm.faces
+    verts=smplx_output.vertices.detach().numpy().squeeze() - delta
+    # verts = smplx_output.vertices.detach().numpy().squeeze()
+    # verts, y_min = adjust_mesh2ground(verts)
 
     return verts, faces

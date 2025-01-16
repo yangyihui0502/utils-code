@@ -30,11 +30,11 @@ def wis3d_add_skeleton(vis3d: Wis3D, t: int, joints, parents: list, name: str):
     end_points = np.stack(end_points, axis=0)
     vis3d.add_lines(start_points=start_points, end_points=end_points, name=name)
 
-
+# 可视化rotation
 def wis3d_add_coord(wis3d: Wis3D, t: int, axis, origin, name: str):
     '''
         axis: (3, 3)
-        origin: (1, 3)
+        origin: (1, 3) !
     '''
     wis3d.set_scene_id(t)
     axis, origin = to_numpy(axis), to_numpy(origin)

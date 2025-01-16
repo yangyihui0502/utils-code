@@ -27,7 +27,7 @@ T_y2z = torch.FloatTensor([[
 
 loc_params = get_motion_unnormalized(pose_series.double())
 loc_params = MoReprTrans.split_pose(loc_params)
-init_root_mat = meta.init_root_mat.double().to('cpu')   # 序列的第一帧的根节点，用于后面的递推
+init_root_mat = meta.init_root_mat.double().to('cpu')   # 序列的第一帧的根节点，用于后面的递推(需要将Rotation Matrix归一化！)
 
 glb = get_glb_root_by_loc(loc_params, init_root_mat)
 glb = get_glb_pose_by_loc(loc_params, glb=glb)
@@ -82,3 +82,19 @@ def get_glb_pose_by_loc(loc, glb=None):
                 glb.pose_pos[:, t] = Lerp(glb.pose_pos[:, t], 
                                             glb.pose_pos[:, t-1] + glb.pose_vel[:, t] / train_fps, 0.5)
     return glb
+
+def recover_data(data, init_root_mat):
+    # init_root_mat为上一帧的局部坐标系基坐标
+    loc_params = get_motion_unnormalized(data.double())
+    loc_params = MoReprTrans.split_pose(loc_params)
+    # loc_params = MoReprTrans.split_pose(data)
+    
+    init_root_mat = init_root_mat.to('cpu').double()
+
+    # loc_params.pose_rot[:, :, 0] = torch.eye(3)
+    glb = get_glb_root_by_loc(loc_params, init_root_mat)
+    glb = get_glb_pose_by_loc(loc_params, glb=glb)
+    # glb.pose_pos = apply_T_on_points(glb.pose_pos, T_y2z)
+    # glb.pose_rot[:, :, :] = T_y2z[..., :3, :3] @ glb.pose_rot[:, :, :]
+
+    return glb.pose_pos, glb.pose_rot, glb.root_mat, loc_params.pose_pos
